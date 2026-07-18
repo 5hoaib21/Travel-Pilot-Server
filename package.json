@@ -1,0 +1,22 @@
+{
+  "name": "travel-pilot-server",
+  "version": "1.0.0",
+  "description": "Travel Pilot backend — Express + MongoDB + Gemini AI",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "@google/generative-ai": "^0.21.0",
+    "mongodb": "^6.9.0",
+    "better-auth": "^1.1.0",
+    "cors": "^2.8.5",
+    "express-rate-limit": "^7.4.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
