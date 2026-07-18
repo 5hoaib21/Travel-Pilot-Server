@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const logger = require('./lib/logger');
+const { connectToDatabase, getDb } = require('./lib/db');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -27,8 +28,14 @@ app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+app.get('/api/health', async (req, res) => {
+  try {
+    const db = await getDb();
+    await db.command({ ping: 1 });
+    res.json({ status: 'ok', db: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'error', db: 'disconnected', error: err.message });
+  }
 });
 
 app.use((err, req, res, next) => {
@@ -42,8 +49,18 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
-  logger.info(`Server running on port ${PORT}`);
-});
+async function start() {
+  try {
+    await connectToDatabase();
+    app.listen(PORT, () => {
+      logger.info(`Server running on port ${PORT}`);
+    });
+  } catch (err) {
+    logger.error('Failed to start server', { error: err.message });
+    process.exit(1);
+  }
+}
+
+start();
 
 module.exports = app;
