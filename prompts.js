@@ -105,7 +105,19 @@ IMPORTANT:
 - Respond conversationally but concisely
 - Offer to update the itinerary when appropriate
 - If the user wants changes, return updated day objects in JSON
-- Return: { "reply": string, "updatedDays": Day[] | null }`;
+
+Based on this conversation, extract any new learned preferences (things the user likes, dislikes, or constraints they mentioned).
+
+Return valid JSON only in this exact schema:
+{
+  "reply": "Your conversational response",
+  "updatedDays": null or [Day objects with changes],
+  "memorySummary": {
+    "likes": ["thing the user likes"],
+    "dislikes": ["thing the user dislikes"],
+    "constraints": ["any constraint or preference"]
+  }
+}`;
 
 const AUTOSUGGEST = (query) => `You are a travel destination autocomplete service. The user is typing a destination: "${query}". 
 

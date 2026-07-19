@@ -192,7 +192,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR, REVIEWER, AUTOSUGGEST } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR, REVIEWER, AUTOSUGGEST, COPILOT } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -487,6 +487,60 @@ async function buildCopilotContext(tripId, userId) {
   };
 
   return { trip, preferences, memory: mergedMemory, history };
+}
+
+async function copilotAgent(trip, preferences, memory, history, userMessage, userId = null, tripId = null) {
+  const prompt = COPILOT(trip, memory, history, userMessage);
+
+  const result = await callWithRetry(
+    prompt,
+    (parsed) => {
+      if (!parsed.reply) return { valid: false, error: 'Missing reply text' };
+      if (typeof parsed.reply !== 'string') return { valid: false, error: 'Reply must be a string' };
+      return { valid: true };
+    },
+    { maxRetries: 1, userId, tripId, featureType: 'copilot' }
+  );
+
+  const reply = result.reply;
+  const updatedDays = result.updatedDays || null;
+  const memorySummary = result.memorySummary || { likes: [], dislikes: [], constraints: [] };
+
+  if (updatedDays && Array.isArray(updatedDays)) {
+    const db = await getDb();
+    for (const updatedDay of updatedDays) {
+      await db.collection('trips').updateOne(
+        { _id: ObjectId.createFromHexString(tripId), 'days.dayNumber': updatedDay.dayNumber },
+        { $set: { 'days.$': updatedDay, updatedAt: new Date() } }
+      );
+    }
+  }
+
+  const session = sessionStore.get(tripId, userId) || { messages: [], learnedPreferences: { likes: [], dislikes: [], constraints: [] } };
+  session.messages.push({ role: 'user', content: userMessage });
+  session.messages.push({ role: 'assistant', content: reply });
+
+  const merged = session.learnedPreferences;
+  merged.likes = [...new Set([...merged.likes, ...(memorySummary.likes || [])])];
+  merged.dislikes = [...new Set([...merged.dislikes, ...(memorySummary.dislikes || [])])];
+  merged.constraints = [...new Set([...merged.constraints, ...(memorySummary.constraints || [])])];
+  sessionStore.set(tripId, userId, { messages: session.messages.slice(-40), learnedPreferences: merged });
+
+  const db = await getDb();
+  await db.collection('ai_generations').insertOne({
+    userId,
+    tripId,
+    featureType: 'copilot',
+    prompt,
+    response: JSON.stringify(result),
+    model: 'gemini-2.0-flash',
+    responseTimeMs: 0,
+    success: true,
+    memorySummary,
+    createdAt: new Date(),
+  });
+
+  return { reply, updatedDays };
 }
 
 async function generateTrip(preferences, userId = null) {
@@ -785,6 +839,36 @@ app.get('/api/trips/favorites', async (req, res, next) => {
   }
 });
 
+app.post('/api/trips/:id/copilot', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { id } = req.params;
+    const { message } = req.body;
+
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Message is required', code: 'VALIDATION_ERROR' });
+    }
+
+    const db = await getDb();
+    const tripDoc = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    if (!tripDoc) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (tripDoc.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    const { trip, preferences, memory, history } = await buildCopilotContext(id, userId);
+    const result = await copilotAgent(trip, preferences, memory, history, message.trim(), userId, id);
+
+    let updatedTrip = null;
+    if (result.updatedDays) {
+      updatedTrip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    }
+
+    res.json({ reply: result.reply, updatedTrip });
+  } catch (err) {
+    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type });
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
@@ -856,6 +940,7 @@ module.exports = {
   curatorAgent,
   reviewerAgent,
   buildCopilotContext,
+  copilotAgent,
   sessionStore,
   callWithRetry,
   buildAgentContext,
