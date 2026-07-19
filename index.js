@@ -398,6 +398,45 @@ async function reviewerAgent(context, userId = null, tripId = null) {
   return fixedContext;
 }
 
+async function generateTrip(preferences, userId = null) {
+  const tripId = null;
+
+  const enriched = await enrichDestination(preferences.destination, userId);
+  let context = buildAgentContext(preferences, enriched);
+
+  context.days = await plannerAgent(context, userId, tripId);
+  context.budgetBreakdown = await budgeterAgent(context, userId, tripId);
+  context.tips = await curatorAgent(context, userId, tripId);
+  context = await reviewerAgent(context, userId, tripId);
+
+  const tripDoc = {
+    userId,
+    destination: enriched.fullName,
+    title: `${enriched.fullName} Adventure`,
+    budget: preferences.budget,
+    currency: preferences.currency,
+    duration: preferences.duration,
+    travelStyle: preferences.travelStyle,
+    interests: preferences.interests,
+    companion: preferences.companion,
+    additionalNotes: preferences.additionalNotes || null,
+    days: context.days,
+    budgetBreakdown: context.budgetBreakdown,
+    tips: context.tips,
+    review: context.review || null,
+    status: 'completed',
+    enrichedDestination: enriched,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  const db = await getDb();
+  const result = await db.collection('trips').insertOne(tripDoc);
+  tripDoc._id = result.insertedId;
+
+  return tripDoc;
+}
+
 const app = express();
 const PORT = process.env.PORT || 8008;
 
@@ -419,6 +458,44 @@ app.use('/api/trips/generate', aiLimiter);
 app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
+
+app.post('/api/trips/generate', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const prefs = req.body;
+
+    if (!prefs.destination || typeof prefs.destination !== 'string') {
+      return res.status(400).json({ error: 'Destination is required', code: 'VALIDATION_ERROR' });
+    }
+    if (!prefs.budget || typeof prefs.budget !== 'number' || prefs.budget <= 0) {
+      return res.status(400).json({ error: 'Valid budget is required', code: 'VALIDATION_ERROR' });
+    }
+    if (!prefs.duration || !Number.isInteger(prefs.duration) || prefs.duration < 1 || prefs.duration > 30) {
+      return res.status(400).json({ error: 'Duration must be 1-30 days', code: 'VALIDATION_ERROR' });
+    }
+    if (!prefs.travelStyle) {
+      return res.status(400).json({ error: 'Travel style is required', code: 'VALIDATION_ERROR' });
+    }
+    if (!prefs.interests || !Array.isArray(prefs.interests) || prefs.interests.length === 0) {
+      return res.status(400).json({ error: 'At least one interest is required', code: 'VALIDATION_ERROR' });
+    }
+    if (!prefs.companion) {
+      return res.status(400).json({ error: 'Companion type is required', code: 'VALIDATION_ERROR' });
+    }
+
+    const trip = await generateTrip(prefs, userId);
+    res.status(201).json({ trip });
+  } catch (err) {
+    if (err instanceof AIError) {
+      return res.status(400).json({
+        error: err.message,
+        code: err.type,
+        details: err.details,
+      });
+    }
+    next(err);
+  }
+});
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -457,6 +534,7 @@ start();
 
 module.exports = {
   app,
+  generateTrip,
   enrichDestination,
   plannerAgent,
   budgeterAgent,
