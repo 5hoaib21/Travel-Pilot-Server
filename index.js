@@ -142,7 +142,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION, PLANNER, BUDGETER } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -279,6 +279,45 @@ async function budgeterAgent(context, userId = null, tripId = null) {
   return result.budgetBreakdown;
 }
 
+async function curatorAgent(context, userId = null, tripId = null) {
+  function validateTips(parsed) {
+    if (!parsed.tips || !Array.isArray(parsed.tips)) {
+      return { valid: false, error: 'Missing tips array' };
+    }
+    if (parsed.tips.length < 5 || parsed.tips.length > 8) {
+      return { valid: false, error: `Expected 5-8 tips, got ${parsed.tips.length}` };
+    }
+
+    const requiredCategories = ['Weather', 'Culture', 'Safety', 'Packing', 'Currency', 'Language'];
+    const categories = parsed.tips.map((t) => t.category);
+    for (const cat of requiredCategories) {
+      if (!categories.includes(cat)) {
+        return { valid: false, error: `Missing tip category: ${cat}` };
+      }
+    }
+
+    for (const tip of parsed.tips) {
+      if (!tip.category || !tip.content || tip.priority == null) {
+        return { valid: false, error: `Tip missing required field(s): category, content, or priority` };
+      }
+      if (tip.priority < 1 || tip.priority > 5) {
+        return { valid: false, error: `Tip priority ${tip.priority} out of range (1-5)` };
+      }
+    }
+
+    return { valid: true };
+  }
+
+  const prompt = CURATOR(context);
+  const result = await callWithRetry(
+    prompt,
+    validateTips,
+    { maxRetries: 2, userId, tripId, featureType: 'curator' }
+  );
+
+  return result.tips;
+}
+
 const app = express();
 const PORT = process.env.PORT || 8008;
 
@@ -341,6 +380,7 @@ module.exports = {
   enrichDestination,
   plannerAgent,
   budgeterAgent,
+  curatorAgent,
   callWithRetry,
   buildAgentContext,
   AIError,
