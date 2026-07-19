@@ -588,6 +588,49 @@ app.post('/api/trips/:id/regenerate-day', async (req, res, next) => {
   }
 });
 
+app.patch('/api/trips/:id/favorite', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { id } = req.params;
+    const { favorite } = req.body;
+
+    if (typeof favorite !== 'boolean') {
+      return res.status(400).json({ error: 'favorite must be a boolean', code: 'VALIDATION_ERROR' });
+    }
+
+    const db = await getDb();
+    const existing = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    if (!existing) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (existing.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    await db.collection('trips').updateOne(
+      { _id: ObjectId.createFromHexString(id) },
+      { $set: { favorite, updatedAt: new Date() } }
+    );
+
+    res.json({ success: true, favorite });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/trips/favorites', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.json({ trips: [], total: 0 });
+
+    const db = await getDb();
+    const trips = await db.collection('trips')
+      .find({ userId, favorite: true })
+      .sort({ updatedAt: -1 })
+      .toArray();
+
+    res.json({ trips, total: trips.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
