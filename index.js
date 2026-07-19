@@ -1088,6 +1088,55 @@ app.get('/api/trips/shared/:id', async (req, res, next) => {
   }
 });
 
+app.get('/api/trips/explore', async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const { search, budgetMin, budgetMax, duration, travelStyle, interests, companion, sort, page = '1', limit = '12' } = req.query;
+
+    const filter = { isPublic: true };
+
+    if (search) filter.destination = { $regex: search, $options: 'i' };
+    if (budgetMin || budgetMax) {
+      filter.budget = {};
+      if (budgetMin) filter.budget.$gte = Number(budgetMin);
+      if (budgetMax) filter.budget.$lte = Number(budgetMax);
+    }
+    if (duration) {
+      const ranges = duration.split(',').map((d) => {
+        const [min, max] = d.split('-').map(Number);
+        return max ? { $gte: min, $lte: max } : { $gte: min };
+      });
+      filter.$or = ranges.map((r) => ({ duration: r }));
+    }
+    if (travelStyle) filter.travelStyle = { $in: travelStyle.split(',') };
+    if (interests) filter.interests = { $in: interests.split(',') };
+    if (companion && companion !== 'All') filter.companion = companion;
+
+    let sortObj = { createdAt: -1 };
+    if (sort === 'budget_asc') sortObj = { budget: 1 };
+    else if (sort === 'budget_desc') sortObj = { budget: -1 };
+    else if (sort === 'duration') sortObj = { duration: -1 };
+
+    const pageNum = Math.max(1, Number(page));
+    const limitNum = Math.min(50, Math.max(1, Number(limit)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [trips, total] = await Promise.all([
+      db.collection('trips').find(filter)
+        .project({ userId: 0 })
+        .sort(sortObj)
+        .skip(skip)
+        .limit(limitNum)
+        .toArray(),
+      db.collection('trips').countDocuments(filter),
+    ]);
+
+    res.json({ trips, total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
