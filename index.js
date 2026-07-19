@@ -5,6 +5,142 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const logger = require('./lib/logger');
 const { connectToDatabase, getDb } = require('./lib/db');
+const { generateContent, DEFAULT_MODEL } = require('./lib/gemini');
+
+const AIErrorTypes = {
+  AI_PARSE_ERROR: 'AI_PARSE_ERROR',
+  AI_TIMEOUT: 'AI_TIMEOUT',
+  AI_SAFETY_BLOCK: 'AI_SAFETY_BLOCK',
+  AI_RATE_LIMIT: 'AI_RATE_LIMIT',
+};
+
+class AIError extends Error {
+  constructor(type, message, details = null) {
+    super(message);
+    this.name = 'AIError';
+    this.type = type;
+    this.code = type;
+    this.details = details;
+  }
+}
+
+async function logAICall({ userId, tripId, featureType, prompt, response, model, responseTimeMs, success, errorMessage }) {
+  try {
+    const db = await getDb();
+    await db.collection('ai_generations').insertOne({
+      userId,
+      tripId,
+      featureType,
+      prompt,
+      response,
+      model,
+      responseTimeMs,
+      success,
+      errorMessage,
+      createdAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('Failed to log AI call', { error: err.message });
+  }
+}
+
+function buildAgentContext(preferences, enrichedDestination = null, days = null, budgetBreakdown = null, tips = null, review = null) {
+  return {
+    preferences,
+    enrichedDestination,
+    days,
+    budgetBreakdown,
+    tips,
+    review,
+  };
+}
+
+function extractJSON(text) {
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new AIError(AIErrorTypes.AI_PARSE_ERROR, 'No JSON object found in AI response', { text });
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    throw new AIError(AIErrorTypes.AI_PARSE_ERROR, `Failed to parse AI response: ${err.message}`, { text: jsonMatch[0] });
+  }
+}
+
+async function callWithRetry(prompt, validateFn, options = {}) {
+  const { maxRetries = 2, modelName = DEFAULT_MODEL, userId = null, tripId = null, featureType = 'unknown' } = options;
+
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const start = Date.now();
+    try {
+      const result = await generateContent(prompt, { modelName });
+      const parsed = extractJSON(result.text);
+      const responseTimeMs = Date.now() - start;
+
+      if (validateFn) {
+        const validation = validateFn(parsed);
+        if (!validation.valid) {
+          throw new AIError(AIErrorTypes.AI_PARSE_ERROR, validation.error, { parsed });
+        }
+      }
+
+      await logAICall({
+        userId,
+        tripId,
+        featureType,
+        prompt,
+        response: result.text,
+        model: result.model,
+        responseTimeMs,
+        success: true,
+      });
+
+      return parsed;
+    } catch (err) {
+      const responseTimeMs = Date.now() - start;
+
+      if (err instanceof AIError && err.type === AIErrorTypes.AI_PARSE_ERROR) {
+        lastError = err;
+        logger.warn(`AI parse error on attempt ${attempt + 1}/${maxRetries + 1}`, { error: err.message, featureType });
+
+        await logAICall({
+          userId,
+          tripId,
+          featureType,
+          prompt: attempt < maxRetries ? `${prompt}\n\nPrevious error: ${err.message}. Please ensure the response is valid JSON only.` : prompt,
+          response: err.details?.text || null,
+          model: modelName,
+          responseTimeMs,
+          success: false,
+          errorMessage: err.message,
+        });
+
+        if (attempt < maxRetries) {
+          prompt = `${prompt}\n\nPrevious error: ${err.message}. Please ensure the response is valid JSON only.`;
+        }
+        continue;
+      }
+
+      if (err.isTimeout) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_TIMEOUT' });
+        throw new AIError(AIErrorTypes.AI_TIMEOUT, 'AI request timed out', { model: modelName });
+      }
+      if (err.isSafety) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_SAFETY_BLOCK' });
+        throw new AIError(AIErrorTypes.AI_SAFETY_BLOCK, 'AI request blocked by safety filters');
+      }
+      if (err.isRateLimit) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_RATE_LIMIT' });
+        throw new AIError(AIErrorTypes.AI_RATE_LIMIT, 'AI rate limit exceeded');
+      }
+
+      logger.error(`Unexpected AI error on attempt ${attempt + 1}`, { error: err.message, featureType });
+      lastError = err;
+    }
+  }
+
+  throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
+}
 
 const app = express();
 const PORT = process.env.PORT || 8008;
