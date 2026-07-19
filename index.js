@@ -966,6 +966,68 @@ app.delete('/api/conversations/:tripId', async (req, res, next) => {
   }
 });
 
+app.get('/api/user/profile', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
+
+    const db = await getDb();
+    const user = await db.collection('users').findOne(
+      { _id: ObjectId.createFromHexString(userId) },
+      { projection: { password: 0 } }
+    );
+
+    if (!user) return res.status(404).json({ error: 'User not found', code: 'NOT_FOUND' });
+    res.json({ user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch('/api/user/profile', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
+
+    const { name, defaultCurrency, preferredLanguage, emailNotifications, tripReminders } = req.body;
+
+    const update = {};
+    if (name !== undefined) update.name = name;
+    if (defaultCurrency !== undefined) update.defaultCurrency = defaultCurrency;
+    if (preferredLanguage !== undefined) update.preferredLanguage = preferredLanguage;
+    if (emailNotifications !== undefined) update.emailNotifications = emailNotifications;
+    if (tripReminders !== undefined) update.tripReminders = tripReminders;
+    update.updatedAt = new Date();
+
+    const db = await getDb();
+    await db.collection('users').updateOne(
+      { _id: ObjectId.createFromHexString(userId) },
+      { $set: update }
+    );
+
+    const user = await db.collection('users').findOne({ _id: ObjectId.createFromHexString(userId) });
+    res.json({ user });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/user/account', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
+
+    const db = await getDb();
+    await db.collection('trips').deleteMany({ userId });
+    await db.collection('ai_generations').deleteMany({ userId });
+    await db.collection('users').deleteOne({ _id: ObjectId.createFromHexString(userId) });
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
