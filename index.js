@@ -105,6 +105,151 @@ function buildAgentContext(preferences, enrichedDestination = null, days = null,
   };
 }
 
+// --- Validation Utilities ---
+
+const ALLOWED_CURRENCIES = ['USD', 'INR', 'EUR', 'GBP', 'AUD', 'CAD', 'JPY', 'THB', 'SGD', 'MYR'];
+const ALLOWED_STYLES = ['Relaxed', 'Balanced', 'Adventure'];
+const ALLOWED_INTERESTS = ['Nature', 'History', 'Food', 'Shopping', 'Nightlife', 'Adventure', 'Culture', 'Wildlife'];
+const ALLOWED_COMPANIONS = ['Solo', 'Couple', 'Family', 'Friends'];
+
+function validate(rules) {
+  return (req, res, next) => {
+    const errors = [];
+    for (const [field, validators] of Object.entries(rules)) {
+      const value = req.body[field];
+      for (const validator of validators) {
+        const error = validator(value, field);
+        if (error) errors.push({ field, message: error });
+      }
+    }
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'Validation failed', code: 'VALIDATION_ERROR', details: errors });
+    }
+    next();
+  };
+}
+
+// Primitive validators
+const required = (msg) => (v, f) => (v === undefined || v === null || v === '') ? (msg || `${f} is required`) : null;
+const isString = (msg) => (v, f) => (v !== undefined && typeof v !== 'string') ? (msg || `${f} must be a string`) : null;
+const isNumber = (msg) => (v, f) => (v !== undefined && typeof v !== 'number') ? (msg || `${f} must be a number`) : null;
+const isInteger = (msg) => (v, f) => (v !== undefined && !Number.isInteger(v)) ? (msg || `${f} must be an integer`) : null;
+const isArray = (msg) => (v, f) => (v !== undefined && !Array.isArray(v)) ? (msg || `${f} must be an array`) : null;
+const isBoolean = (msg) => (v, f) => (v !== undefined && typeof v !== 'boolean') ? (msg || `${f} must be a boolean`) : null;
+const min = (n, msg) => (v, f) => (v !== undefined && v !== null && v < n) ? (msg || `${f} must be at least ${n}`) : null;
+const max = (n, msg) => (v, f) => (v !== undefined && v !== null && v > n) ? (msg || `${f} must be at most ${n}`) : null;
+const minLength = (n, msg) => (v, f) => (v !== undefined && v !== null && typeof v === 'string' && v.length < n) ? (msg || `${f} must be at least ${n} characters`) : null;
+const maxLength = (n, msg) => (v, f) => (v !== undefined && v !== null && typeof v === 'string' && v.length > n) ? (msg || `${f} must be at most ${n} characters`) : null;
+const minItems = (n, msg) => (v, f) => (Array.isArray(v) && v.length < n) ? (msg || `${f} must have at least ${n} items`) : null;
+const oneOf = (options, msg) => (v, f) => (v !== undefined && v !== null && !options.includes(v)) ? (msg || `${f} must be one of: ${options.join(', ')}`) : null;
+
+const generateTripRules = {
+  destination: [required('Destination is required'), isString(), minLength(2, 'Destination must be at least 2 characters'), maxLength(100, 'Destination must be under 100 characters')],
+  budget: [required('Budget is required'), isNumber(), min(1, 'Budget must be at least 1'), max(1000000, 'Budget must be at most 1,000,000')],
+  currency: [required('Currency is required'), oneOf(ALLOWED_CURRENCIES, 'Unsupported currency')],
+  duration: [required('Duration is required'), isInteger(), min(1, 'Duration must be at least 1'), max(30, 'Duration must be at most 30')],
+  travelStyle: [required('Travel style is required'), oneOf(ALLOWED_STYLES)],
+  interests: [required('At least one interest is required'), isArray(), minItems(1, 'Select at least one interest')],
+  companion: [required('Companion type is required'), oneOf(ALLOWED_COMPANIONS)],
+};
+
+const copilotMessageRules = {
+  message: [required('Message is required'), isString(), minLength(1, 'Message cannot be empty'), maxLength(2000, 'Message must be under 2000 characters')],
+};
+
+const regenerateDayRules = {
+  dayNumber: [required('Day number is required'), isInteger(), min(1, 'Day number must be positive')],
+};
+
+const updateProfileRules = {
+  name: [isString(), minLength(2, 'Name must be at least 2 characters'), maxLength(100, 'Name must be under 100 characters')],
+};
+
+const favoriteTripRules = {
+  favorite: [required('favorite is required'), isBoolean('favorite must be a boolean')],
+};
+
+const exportTripRules = {};
+
+
+function stripHtmlTags(v) {
+  if (v && typeof v === 'string') return v.replace(/<[^>]*>/g, '');
+  return v;
+}
+
+function validateDayOutput(parsed, duration, budget) {
+  if (!parsed.days || !Array.isArray(parsed.days) || parsed.days.length !== duration) {
+    return { valid: false, error: `Expected ${duration} days, got ${parsed.days?.length || 0}` };
+  }
+  for (let i = 0; i < parsed.days.length; i++) {
+    const day = parsed.days[i];
+    if (!day.morning || !day.afternoon || !day.evening) {
+      return { valid: false, error: `Day ${day.dayNumber || i + 1} missing time slot activities`, day: day.dayNumber || i + 1 };
+    }
+    if (!day.accommodation || !day.accommodation.name) {
+      return { valid: false, error: `Day ${day.dayNumber || i + 1} missing accommodation`, day: day.dayNumber || i + 1 };
+    }
+    const slots = ['morning', 'afternoon', 'evening'];
+    for (const slot of slots) {
+      const activity = day[slot];
+      if (activity && !['attraction', 'meal', 'transport', 'rest'].includes(activity.category)) {
+        return { valid: false, error: `Day ${day.dayNumber || i + 1} ${slot} has invalid category: ${activity.category}`, day: day.dayNumber || i + 1 };
+      }
+    }
+  }
+  const totalAccommodationCost = parsed.days.reduce((sum, d) => {
+    const cost = parseFloat(d.accommodation?.costPerNight) || 0;
+    return sum + cost;
+  }, 0);
+  if (totalAccommodationCost > budget * 0.5) {
+    return { valid: false, error: `Accommodation costs (${totalAccommodationCost}) exceed 50% of budget (${budget})` };
+  }
+  return { valid: true };
+}
+
+function validateBudgetOutput(parsed, budget) {
+  if (!parsed.budgetBreakdown || !Array.isArray(parsed.budgetBreakdown)) {
+    return { valid: false, error: 'Missing budgetBreakdown array' };
+  }
+  const requiredCategories = ['Accommodation', 'Food', 'Activities', 'Transport', 'Miscellaneous'];
+  const categories = parsed.budgetBreakdown.map((b) => b.category);
+  for (const cat of requiredCategories) {
+    if (!categories.includes(cat)) return { valid: false, error: `Missing category: ${cat}` };
+  }
+  for (const item of parsed.budgetBreakdown) {
+    if (item.amount == null || item.percentage == null) return { valid: false, error: `Category ${item.category} missing amount or percentage` };
+    if (typeof item.amount !== 'number' || typeof item.percentage !== 'number') return { valid: false, error: `Category ${item.category} has non-numeric amount or percentage` };
+  }
+  const totalPercentage = Math.round(parsed.budgetBreakdown.reduce((sum, b) => sum + b.percentage, 0));
+  if (totalPercentage < 99 || totalPercentage > 101) return { valid: false, error: `Percentages sum to ${totalPercentage}%, expected ~100%` };
+  const totalAmount = parsed.budgetBreakdown.reduce((sum, b) => sum + b.amount, 0);
+  if (totalAmount > budget * 1.05) return { valid: false, error: `Total budget (${totalAmount}) exceeds trip budget (${budget}) by more than 5%` };
+  return { valid: true };
+}
+
+function validateTipsOutput(parsed) {
+  if (!parsed.tips || !Array.isArray(parsed.tips)) return { valid: false, error: 'Missing tips array' };
+  if (parsed.tips.length < 5 || parsed.tips.length > 8) return { valid: false, error: `Expected 5-8 tips, got ${parsed.tips.length}` };
+  const requiredCategories = ['Weather', 'Culture', 'Safety', 'Packing', 'Currency', 'Language'];
+  const categories = parsed.tips.map((t) => t.category);
+  for (const cat of requiredCategories) {
+    if (!categories.includes(cat)) return { valid: false, error: `Missing tip category: ${cat}` };
+  }
+  for (const tip of parsed.tips) {
+    if (!tip.category || !tip.content || tip.priority == null) return { valid: false, error: 'Tip missing required field(s): category, content, or priority' };
+    if (tip.priority < 1 || tip.priority > 5) return { valid: false, error: `Tip priority ${tip.priority} out of range (1-5)` };
+  }
+  return { valid: true };
+}
+
+function validateReviewOutput(parsed) {
+  if (!parsed.review) return { valid: false, error: 'Missing review object' };
+  if (typeof parsed.review.passed !== 'boolean') return { valid: false, error: 'Review missing passed boolean' };
+  if (!Array.isArray(parsed.review.issues)) return { valid: false, error: 'Review missing issues array' };
+  if (!Array.isArray(parsed.review.warnings)) return { valid: false, error: 'Review missing warnings array' };
+  return { valid: true };
+}
+
 function extractJSON(text) {
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new AIError(AIErrorTypes.AI_PARSE_ERROR, 'No JSON object found in AI response', { text });
@@ -233,44 +378,10 @@ async function plannerAgent(context, userId = null, tripId = null) {
   const budget = context.preferences.budget;
   const duration = context.preferences.duration;
 
-  function validateDays(parsed) {
-    if (!parsed.days || !Array.isArray(parsed.days) || parsed.days.length !== duration) {
-      return { valid: false, error: `Expected ${duration} days, got ${parsed.days?.length || 0}` };
-    }
-
-    for (let i = 0; i < parsed.days.length; i++) {
-      const day = parsed.days[i];
-      if (!day.morning || !day.afternoon || !day.evening) {
-        return { valid: false, error: `Day ${day.dayNumber || i + 1} missing time slot activities`, day: day.dayNumber || i + 1 };
-      }
-      if (!day.accommodation || !day.accommodation.name) {
-        return { valid: false, error: `Day ${day.dayNumber || i + 1} missing accommodation`, day: day.dayNumber || i + 1 };
-      }
-      const slots = ['morning', 'afternoon', 'evening'];
-      for (const slot of slots) {
-        const activity = day[slot];
-        if (activity && !['attraction', 'meal', 'transport', 'rest'].includes(activity.category)) {
-          return { valid: false, error: `Day ${day.dayNumber || i + 1} ${slot} has invalid category: ${activity.category}`, day: day.dayNumber || i + 1 };
-        }
-      }
-    }
-
-    const totalAccommodationCost = parsed.days.reduce((sum, d) => {
-      const cost = parseFloat(d.accommodation?.costPerNight) || 0;
-      return sum + cost;
-    }, 0);
-
-    if (totalAccommodationCost > budget * 0.5) {
-      return { valid: false, error: `Accommodation costs (${totalAccommodationCost}) exceed 50% of budget (${budget})` };
-    }
-
-    return { valid: true };
-  }
-
   const prompt = PLANNER(context);
   const result = await callWithRetry(
     prompt,
-    validateDays,
+    (parsed) => validateDayOutput(parsed, duration, budget),
     { maxRetries: 2, userId, tripId, featureType: 'planner' }
   );
 
@@ -284,45 +395,10 @@ async function plannerAgent(context, userId = null, tripId = null) {
 async function budgeterAgent(context, userId = null, tripId = null) {
   const budget = context.preferences.budget;
 
-  function validateBudget(parsed) {
-    if (!parsed.budgetBreakdown || !Array.isArray(parsed.budgetBreakdown)) {
-      return { valid: false, error: 'Missing budgetBreakdown array' };
-    }
-
-    const requiredCategories = ['Accommodation', 'Food', 'Activities', 'Transport', 'Miscellaneous'];
-    const categories = parsed.budgetBreakdown.map((b) => b.category);
-    for (const cat of requiredCategories) {
-      if (!categories.includes(cat)) {
-        return { valid: false, error: `Missing category: ${cat}` };
-      }
-    }
-
-    for (const item of parsed.budgetBreakdown) {
-      if (item.amount == null || item.percentage == null) {
-        return { valid: false, error: `Category ${item.category} missing amount or percentage` };
-      }
-      if (typeof item.amount !== 'number' || typeof item.percentage !== 'number') {
-        return { valid: false, error: `Category ${item.category} has non-numeric amount or percentage` };
-      }
-    }
-
-    const totalPercentage = Math.round(parsed.budgetBreakdown.reduce((sum, b) => sum + b.percentage, 0));
-    if (totalPercentage < 99 || totalPercentage > 101) {
-      return { valid: false, error: `Percentages sum to ${totalPercentage}%, expected ~100%` };
-    }
-
-    const totalAmount = parsed.budgetBreakdown.reduce((sum, b) => sum + b.amount, 0);
-    if (totalAmount > budget * 1.05) {
-      return { valid: false, error: `Total budget (${totalAmount}) exceeds trip budget (${budget}) by more than 5%` };
-    }
-
-    return { valid: true };
-  }
-
   const prompt = BUDGETER(context);
   const result = await callWithRetry(
     prompt,
-    validateBudget,
+    (parsed) => validateBudgetOutput(parsed, budget),
     { maxRetries: 2, userId, tripId, featureType: 'budgeter' }
   );
 
@@ -330,38 +406,10 @@ async function budgeterAgent(context, userId = null, tripId = null) {
 }
 
 async function curatorAgent(context, userId = null, tripId = null) {
-  function validateTips(parsed) {
-    if (!parsed.tips || !Array.isArray(parsed.tips)) {
-      return { valid: false, error: 'Missing tips array' };
-    }
-    if (parsed.tips.length < 5 || parsed.tips.length > 8) {
-      return { valid: false, error: `Expected 5-8 tips, got ${parsed.tips.length}` };
-    }
-
-    const requiredCategories = ['Weather', 'Culture', 'Safety', 'Packing', 'Currency', 'Language'];
-    const categories = parsed.tips.map((t) => t.category);
-    for (const cat of requiredCategories) {
-      if (!categories.includes(cat)) {
-        return { valid: false, error: `Missing tip category: ${cat}` };
-      }
-    }
-
-    for (const tip of parsed.tips) {
-      if (!tip.category || !tip.content || tip.priority == null) {
-        return { valid: false, error: `Tip missing required field(s): category, content, or priority` };
-      }
-      if (tip.priority < 1 || tip.priority > 5) {
-        return { valid: false, error: `Tip priority ${tip.priority} out of range (1-5)` };
-      }
-    }
-
-    return { valid: true };
-  }
-
   const prompt = CURATOR(context);
   const result = await callWithRetry(
     prompt,
-    validateTips,
+    validateTipsOutput,
     { maxRetries: 2, userId, tripId, featureType: 'curator' }
   );
 
@@ -371,29 +419,13 @@ async function curatorAgent(context, userId = null, tripId = null) {
 async function reviewerAgent(context, userId = null, tripId = null) {
   const fixes = [];
 
-  function validateReview(parsed) {
-    if (!parsed.review) {
-      return { valid: false, error: 'Missing review object' };
-    }
-    if (typeof parsed.review.passed !== 'boolean') {
-      return { valid: false, error: 'Review missing passed boolean' };
-    }
-    if (!Array.isArray(parsed.review.issues)) {
-      return { valid: false, error: 'Review missing issues array' };
-    }
-    if (!Array.isArray(parsed.review.warnings)) {
-      return { valid: false, error: 'Review missing warnings array' };
-    }
-    return { valid: true };
-  }
-
   const prompt = REVIEWER(context);
   let result;
 
   try {
     result = await callWithRetry(
       prompt,
-      validateReview,
+      validateReviewOutput,
       { maxRetries: 1, userId, tripId, featureType: 'reviewer' }
     );
   } catch (err) {
@@ -632,29 +664,12 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-app.post('/api/trips/generate', async (req, res, next) => {
+app.post('/api/trips/generate', validate(generateTripRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
     const prefs = req.body;
-
-    if (!prefs.destination || typeof prefs.destination !== 'string') {
-      return res.status(400).json({ error: 'Destination is required', code: 'VALIDATION_ERROR' });
-    }
-    if (!prefs.budget || typeof prefs.budget !== 'number' || prefs.budget <= 0) {
-      return res.status(400).json({ error: 'Valid budget is required', code: 'VALIDATION_ERROR' });
-    }
-    if (!prefs.duration || !Number.isInteger(prefs.duration) || prefs.duration < 1 || prefs.duration > 30) {
-      return res.status(400).json({ error: 'Duration must be 1-30 days', code: 'VALIDATION_ERROR' });
-    }
-    if (!prefs.travelStyle) {
-      return res.status(400).json({ error: 'Travel style is required', code: 'VALIDATION_ERROR' });
-    }
-    if (!prefs.interests || !Array.isArray(prefs.interests) || prefs.interests.length === 0) {
-      return res.status(400).json({ error: 'At least one interest is required', code: 'VALIDATION_ERROR' });
-    }
-    if (!prefs.companion) {
-      return res.status(400).json({ error: 'Companion type is required', code: 'VALIDATION_ERROR' });
-    }
+    if (prefs.destination) prefs.destination = stripHtmlTags(prefs.destination);
+    if (prefs.additionalNotes) prefs.additionalNotes = stripHtmlTags(prefs.additionalNotes);
 
     const trip = await generateTrip(prefs, userId);
     res.status(201).json({ trip });
@@ -706,15 +721,11 @@ app.post('/api/trips/:id/regenerate', async (req, res, next) => {
   }
 });
 
-app.post('/api/trips/:id/regenerate-day', async (req, res, next) => {
+app.post('/api/trips/:id/regenerate-day', validate(regenerateDayRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
     const { id } = req.params;
     const { dayNumber } = req.body;
-
-    if (!dayNumber || dayNumber < 1) {
-      return res.status(400).json({ error: 'Valid dayNumber is required', code: 'VALIDATION_ERROR' });
-    }
 
     const db = await getDb();
     const existing = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
@@ -759,15 +770,11 @@ app.post('/api/trips/:id/regenerate-day', async (req, res, next) => {
   }
 });
 
-app.patch('/api/trips/:id/favorite', async (req, res, next) => {
+app.patch('/api/trips/:id/favorite', validate(favoriteTripRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
     const { id } = req.params;
     const { favorite } = req.body;
-
-    if (typeof favorite !== 'boolean') {
-      return res.status(400).json({ error: 'favorite must be a boolean', code: 'VALIDATION_ERROR' });
-    }
 
     const db = await getDb();
     const existing = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
@@ -866,15 +873,11 @@ app.get('/api/trips/favorites', async (req, res, next) => {
   }
 });
 
-app.post('/api/trips/:id/copilot', async (req, res, next) => {
+app.post('/api/trips/:id/copilot', validate(copilotMessageRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
     const { id } = req.params;
     const { message } = req.body;
-
-    if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      return res.status(400).json({ error: 'Message is required', code: 'VALIDATION_ERROR' });
-    }
 
     const db = await getDb();
     const tripDoc = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
@@ -1031,7 +1034,7 @@ app.get('/api/user/profile', async (req, res, next) => {
   }
 });
 
-app.patch('/api/user/profile', async (req, res, next) => {
+app.patch('/api/user/profile', validate(updateProfileRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
     if (!userId) return res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
@@ -1039,8 +1042,13 @@ app.patch('/api/user/profile', async (req, res, next) => {
     const { name, defaultCurrency, preferredLanguage, emailNotifications, tripReminders } = req.body;
 
     const update = {};
-    if (name !== undefined) update.name = name;
-    if (defaultCurrency !== undefined) update.defaultCurrency = defaultCurrency;
+    if (name !== undefined) update.name = stripHtmlTags(name);
+    if (defaultCurrency !== undefined) {
+      if (!ALLOWED_CURRENCIES.includes(defaultCurrency)) {
+        return res.status(400).json({ error: 'Unsupported currency', code: 'VALIDATION_ERROR' });
+      }
+      update.defaultCurrency = defaultCurrency;
+    }
     if (preferredLanguage !== undefined) update.preferredLanguage = preferredLanguage;
     if (emailNotifications !== undefined) update.emailNotifications = emailNotifications;
     if (tripReminders !== undefined) update.tripReminders = tripReminders;
