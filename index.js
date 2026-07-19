@@ -626,7 +626,7 @@ async function attachUser(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user || req?.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Admin access required', code: 'FORBIDDEN' });
   }
   next();
@@ -1209,12 +1209,84 @@ app.get('/api/admin/me', attachUser, requireAdmin, async (req, res) => {
 app.get('/api/admin/stats', attachUser, requireAdmin, async (req, res, next) => {
   try {
     const db = await getDb();
-    const [totalUsers, totalTrips, totalGenerations] = await Promise.all([
+    const now = new Date();
+    const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const [totalUsers, totalTrips, totalGenerations, failedGenerations, activeUsers, tripsToday] = await Promise.all([
       db.collection('users').countDocuments(),
       db.collection('trips').countDocuments(),
       db.collection('ai_generations').countDocuments(),
+      db.collection('ai_generations').countDocuments({ success: false }),
+      db.collection('users').countDocuments({ lastLoginAt: { $gte: firstOfMonth } }),
+      db.collection('trips').countDocuments({ createdAt: { $gte: startOfToday } }),
     ]);
-    res.json({ totalUsers, totalTrips, totalGenerations });
+
+    const failedPercentage = totalGenerations > 0 ? Math.round((failedGenerations / totalGenerations) * 100) : 0;
+
+    res.json({ totalUsers, totalTrips, totalGenerations, failedGenerations, failedPercentage, activeUsers, tripsToday });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/admin/users', attachUser, requireAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const { search, sort = 'createdAt', order = 'desc', page = '1', limit = '25' } = req.query;
+
+    const filter = {};
+    if (search) {
+      const regex = { $regex: search, $options: 'i' };
+      filter.$or = [{ name: regex }, { email: regex }];
+    }
+
+    const sortObj = {};
+    sortObj[sort] = order === 'asc' ? 1 : -1;
+
+    const pageNum = Math.max(1, Number(page));
+    const limitNum = Math.min(100, Math.max(1, Number(limit)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [users, total] = await Promise.all([
+      db.collection('users').find(filter)
+        .project({ password: 0 })
+        .sort(sortObj)
+        .skip(skip)
+        .limit(limitNum)
+        .toArray(),
+      db.collection('users').countDocuments(filter),
+    ]);
+
+    const userIds = users.map((u) => u._id.toString());
+    const tripCounts = await db.collection('trips').aggregate([
+      { $match: { userId: { $in: userIds } } },
+      { $group: { _id: '$userId', count: { $sum: 1 } } },
+    ]).toArray();
+    const tripMap = {};
+    tripCounts.forEach((t) => { tripMap[t._id] = t.count; });
+    const enriched = users.map((u) => ({ ...u, tripsCount: tripMap[u._id.toString()] || 0 }));
+
+    res.json({ users: enriched, total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch('/api/admin/users/:id/ban', attachUser, requireAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const userId = req.params.id;
+    const user = await db.collection('users').findOne({ _id: ObjectId.createFromHexString(userId) });
+    if (!user) return res.status(404).json({ error: 'User not found', code: 'NOT_FOUND' });
+
+    const banned = !user.banned;
+    await db.collection('users').updateOne(
+      { _id: ObjectId.createFromHexString(userId) },
+      { $set: { banned, updatedAt: new Date() } }
+    );
+
+    res.json({ banned });
   } catch (err) {
     next(err);
   }
