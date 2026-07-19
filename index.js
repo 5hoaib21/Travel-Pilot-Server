@@ -5,6 +5,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const logger = require('./lib/logger');
 const { connectToDatabase, getDb } = require('./lib/db');
+const { ObjectId } = require('mongodb');
 const { generateContent, DEFAULT_MODEL } = require('./lib/gemini');
 
 const AIErrorTypes = {
@@ -494,6 +495,95 @@ app.post('/api/trips/generate', async (req, res, next) => {
         details: err.details,
       });
     }
+    next(err);
+  }
+});
+
+app.post('/api/trips/:id/regenerate', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { id } = req.params;
+
+    const db = await getDb();
+    const existing = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    if (!existing) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (existing.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    const preferences = {
+      destination: existing.enrichedDestination?.fullName || existing.destination,
+      budget: existing.budget,
+      currency: existing.currency,
+      duration: existing.duration,
+      travelStyle: existing.travelStyle,
+      interests: existing.interests,
+      companion: existing.companion,
+      additionalNotes: existing.additionalNotes,
+    };
+
+    const trip = await generateTrip(preferences, userId);
+
+    await db.collection('trips').updateOne(
+      { _id: ObjectId.createFromHexString(id) },
+      { $set: { ...trip, _id: ObjectId.createFromHexString(id), updatedAt: new Date() } }
+    );
+
+    trip._id = id;
+    res.json({ trip });
+  } catch (err) {
+    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type, details: err.details });
+    next(err);
+  }
+});
+
+app.post('/api/trips/:id/regenerate-day', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { id } = req.params;
+    const { dayNumber } = req.body;
+
+    if (!dayNumber || dayNumber < 1) {
+      return res.status(400).json({ error: 'Valid dayNumber is required', code: 'VALIDATION_ERROR' });
+    }
+
+    const db = await getDb();
+    const existing = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    if (!existing) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (existing.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    const context = buildAgentContext(
+      {
+        destination: existing.enrichedDestination?.fullName || existing.destination,
+        budget: existing.budget,
+        currency: existing.currency,
+        duration: existing.duration,
+        travelStyle: existing.travelStyle,
+        interests: existing.interests,
+        companion: existing.companion,
+        additionalNotes: existing.additionalNotes,
+      },
+      existing.enrichedDestination
+    );
+
+    const days = await plannerAgent(context, userId, id);
+
+    const newDay = days.find((d) => d.dayNumber === dayNumber);
+    if (!newDay) {
+      return res.status(400).json({ error: `Day ${dayNumber} not found in generated output`, code: 'VALIDATION_ERROR' });
+    }
+
+    const updatedDays = (existing.days || []).map((d) =>
+      d.dayNumber === dayNumber ? { ...newDay, dayNumber } : d
+    );
+
+    await db.collection('trips').updateOne(
+      { _id: ObjectId.createFromHexString(id) },
+      { $set: { days: updatedDays, updatedAt: new Date() } }
+    );
+
+    const updated = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    res.json({ trip: updated });
+  } catch (err) {
+    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type, details: err.details });
     next(err);
   }
 });
