@@ -1048,6 +1048,46 @@ app.delete('/api/user/account', async (req, res, next) => {
   }
 });
 
+app.post('/api/trips/:id/export', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { id } = req.params;
+
+    const db = await getDb();
+    const trip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+    if (!trip) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (trip.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    await db.collection('trips').updateOne(
+      { _id: ObjectId.createFromHexString(id) },
+      { $set: { isPublic: true, updatedAt: new Date() } }
+    );
+
+    const shareUrl = `${req.protocol}://${req.get('host')}/shared/${id}`;
+    res.json({ shareUrl, isPublic: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/trips/shared/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const db = await getDb();
+    const trip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
+
+    if (!trip || !trip.isPublic) {
+      return res.status(404).json({ error: 'Trip not found or not public', code: 'NOT_FOUND' });
+    }
+
+    const { userId, ...publicTrip } = trip;
+    res.json({ trip: publicTrip });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
