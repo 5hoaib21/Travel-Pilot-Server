@@ -869,6 +869,103 @@ app.post('/api/trips/:id/copilot', async (req, res, next) => {
   }
 });
 
+app.get('/api/conversations', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.json({ conversations: [] });
+
+    const db = await getDb();
+    const generations = await db.collection('ai_generations')
+      .find({ userId, featureType: 'copilot' })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const tripIds = [...new Set(generations.map((g) => g.tripId).filter(Boolean))];
+    const trips = await db.collection('trips')
+      .find({ _id: { $in: tripIds.map((id) => ObjectId.createFromHexString(id)) } })
+      .project({ title: 1, destination: 1 })
+      .toArray();
+
+    const tripMap = {};
+    for (const t of trips) tripMap[t._id.toString()] = t;
+
+    const tripGroups = {};
+    for (const gen of generations) {
+      const tid = gen.tripId;
+      if (!tid) continue;
+      if (!tripGroups[tid]) {
+        tripGroups[tid] = { tripId: tid, messages: [], trip: tripMap[tid] || null };
+      }
+      tripGroups[tid].messages.push({
+        role: gen.prompt?.includes('"role":"user"') ? 'user' : 'assistant',
+        content: gen.response || gen.prompt || '',
+        createdAt: gen.createdAt,
+      });
+    }
+
+    const conversations = Object.values(tripGroups).map((g) => ({
+      tripId: g.tripId,
+      tripTitle: g.trip?.title || g.trip?.destination || 'Unknown Trip',
+      destination: g.trip?.destination || '',
+      lastMessage: g.messages[0]?.createdAt || null,
+      messageCount: g.messages.length,
+    }));
+
+    const search = (req.query.search || '').toLowerCase();
+    const filtered = search
+      ? conversations.filter((c) => c.tripTitle.toLowerCase().includes(search) || c.destination.toLowerCase().includes(search))
+      : conversations;
+
+    res.json({ conversations: filtered });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/conversations/:tripId/messages', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { tripId } = req.params;
+
+    const db = await getDb();
+    const trip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(tripId) });
+    if (!trip) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (trip.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    const generations = await db.collection('ai_generations')
+      .find({ tripId, userId, featureType: 'copilot' })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    const messages = generations.map((g) => ({
+      role: 'assistant',
+      content: g.response || '',
+      createdAt: g.createdAt,
+    }));
+
+    res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/conversations/:tripId', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const { tripId } = req.params;
+
+    const db = await getDb();
+    const trip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(tripId) });
+    if (!trip) return res.status(404).json({ error: 'Trip not found', code: 'NOT_FOUND' });
+    if (trip.userId !== userId) return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+
+    await db.collection('ai_generations').deleteMany({ tripId, userId, featureType: 'copilot' });
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     const db = await getDb();
