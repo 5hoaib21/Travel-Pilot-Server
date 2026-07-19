@@ -605,6 +605,33 @@ app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
 
+async function attachUser(req, res, next) {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (userId) {
+      const db = await getDb();
+      const user = await db.collection('users').findOne(
+        { _id: ObjectId.createFromHexString(userId) },
+        { projection: { password: 0 } }
+      );
+      req.user = user || null;
+    } else {
+      req.user = null;
+    }
+    next();
+  } catch {
+    req.user = null;
+    next();
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required', code: 'FORBIDDEN' });
+  }
+  next();
+}
+
 app.post('/api/trips/generate', async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
@@ -1171,6 +1198,25 @@ app.get('/api/trips/autosuggest', async (req, res, next) => {
   } catch (err) {
     logger.warn('Autosuggest error', { error: err.message });
     res.json({ suggestions: [] });
+  }
+});
+
+app.get('/api/admin/me', attachUser, requireAdmin, async (req, res) => {
+  const { password, ...safe } = req.user;
+  res.json({ user: safe });
+});
+
+app.get('/api/admin/stats', attachUser, requireAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const [totalUsers, totalTrips, totalGenerations] = await Promise.all([
+      db.collection('users').countDocuments(),
+      db.collection('trips').countDocuments(),
+      db.collection('ai_generations').countDocuments(),
+    ]);
+    res.json({ totalUsers, totalTrips, totalGenerations });
+  } catch (err) {
+    next(err);
   }
 });
 
