@@ -142,7 +142,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR, REVIEWER } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR, REVIEWER, AUTOSUGGEST } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -455,6 +455,7 @@ const aiLimiter = rateLimit({
 });
 
 app.use('/api/trips/generate', aiLimiter);
+app.use('/api/trips/autosuggest', aiLimiter);
 app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
@@ -504,6 +505,33 @@ app.get('/api/health', async (req, res) => {
     res.json({ status: 'ok', db: 'connected' });
   } catch (err) {
     res.status(503).json({ status: 'error', db: 'disconnected', error: err.message });
+  }
+});
+
+app.get('/api/trips/autosuggest', async (req, res, next) => {
+  try {
+    const query = (req.query.q || '').trim();
+    if (!query || query.length < 2) {
+      return res.json({ suggestions: [] });
+    }
+
+    const prompt = AUTOSUGGEST(query);
+    const result = await callWithRetry(
+      prompt,
+      (parsed) => {
+        if (!parsed.suggestions || !Array.isArray(parsed.suggestions)) {
+          return { valid: false, error: 'Missing suggestions array' };
+        }
+        return { valid: true };
+      },
+      { maxRetries: 1, featureType: 'autosuggest' }
+    );
+
+    const unique = [...new Set(result.suggestions)].slice(0, 5);
+    res.json({ suggestions: unique });
+  } catch (err) {
+    logger.warn('Autosuggest error', { error: err.message });
+    res.json({ suggestions: [] });
   }
 });
 

@@ -107,7 +107,22 @@ IMPORTANT:
 - If the user wants changes, return updated day objects in JSON
 - Return: { "reply": string, "updatedDays": Day[] | null }`;
 
-const AUTOSUGGEST = (query) => `List 5 real city/country travel destinations matching "${query}". Return JSON: { suggestions: ["City, Country", ...] }`;
+const AUTOSUGGEST = (query) => `You are a travel destination autocomplete service. The user is typing a destination: "${query}". 
+
+Return up to 5 real-world travel destination suggestions that match this query. Consider:
+- Major cities and countries
+- Well-known travel destinations
+- Common variations and alternate names
+
+Return valid JSON only in this exact schema:
+{ "suggestions": ["City, Country", "City, Country", ...] }
+
+Rules:
+- If the query is empty, return { "suggestions": [] }
+- If no matches found, return { "suggestions": [] }
+- Each suggestion must include both city and country name
+- No duplicate suggestions
+- Suggestions must be real places`;
 
 module.exports = {
   ENRICH_DESTINATION,
