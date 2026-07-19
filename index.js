@@ -614,6 +614,70 @@ app.patch('/api/trips/:id/favorite', async (req, res, next) => {
   }
 });
 
+app.get('/api/analytics/summary', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    const db = await getDb();
+
+    const monthlyTrips = await db.collection('trips').aggregate([
+      { $match: { userId } },
+      {
+        $group: {
+          _id: { year: { $year: '$createdAt' }, month: { $month: '$createdAt' } },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } },
+    ]).toArray();
+
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const found = monthlyTrips.find((m) => m._id.year === d.getFullYear() && m._id.month === d.getMonth() + 1);
+      months.push({ month: key, trips: found ? found.count : 0 });
+    }
+
+    const durationBuckets = await db.collection('trips').aggregate([
+      { $match: { userId } },
+      {
+        $bucket: {
+          groupBy: '$duration',
+          boundaries: [0, 3, 7, 14, 31],
+          default: '15+',
+          output: { count: { $sum: 1 } },
+        },
+      },
+    ]).toArray();
+
+    const bucketLabels = { '0': '1-3 days', '3': '4-7 days', '7': '8-14 days', '15+': '15+ days' };
+    const durationDistribution = durationBuckets.map((b) => ({
+      range: bucketLabels[b._id] || String(b._id),
+      count: b.count,
+    }));
+
+    const travelStyleDistribution = await db.collection('trips').aggregate([
+      { $match: { userId } },
+      { $group: { _id: '$travelStyle', count: { $sum: 1 } } },
+    ]).toArray();
+
+    const aiUsage = await db.collection('ai_generations').aggregate([
+      { $match: { userId } },
+      { $group: { _id: '$featureType', count: { $sum: 1 } } },
+    ]).toArray();
+
+    res.json({
+      monthlyTrips: months,
+      durationDistribution,
+      travelStyleDistribution: travelStyleDistribution.map((t) => ({ style: t._id, count: t.count })),
+      aiUsage: aiUsage.map((a) => ({ feature: a._id, count: a.count })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/trips/favorites', async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
