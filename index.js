@@ -142,7 +142,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -177,6 +177,58 @@ async function enrichDestination(rawDestination, userId = null) {
   }
 
   return result.destination;
+}
+
+async function plannerAgent(context, userId = null, tripId = null) {
+  const budget = context.preferences.budget;
+  const duration = context.preferences.duration;
+
+  function validateDays(parsed) {
+    if (!parsed.days || !Array.isArray(parsed.days) || parsed.days.length !== duration) {
+      return { valid: false, error: `Expected ${duration} days, got ${parsed.days?.length || 0}` };
+    }
+
+    for (let i = 0; i < parsed.days.length; i++) {
+      const day = parsed.days[i];
+      if (!day.morning || !day.afternoon || !day.evening) {
+        return { valid: false, error: `Day ${day.dayNumber || i + 1} missing time slot activities`, day: day.dayNumber || i + 1 };
+      }
+      if (!day.accommodation || !day.accommodation.name) {
+        return { valid: false, error: `Day ${day.dayNumber || i + 1} missing accommodation`, day: day.dayNumber || i + 1 };
+      }
+      const slots = ['morning', 'afternoon', 'evening'];
+      for (const slot of slots) {
+        const activity = day[slot];
+        if (activity && !['attraction', 'meal', 'transport', 'rest'].includes(activity.category)) {
+          return { valid: false, error: `Day ${day.dayNumber || i + 1} ${slot} has invalid category: ${activity.category}`, day: day.dayNumber || i + 1 };
+        }
+      }
+    }
+
+    const totalAccommodationCost = parsed.days.reduce((sum, d) => {
+      const cost = parseFloat(d.accommodation?.costPerNight) || 0;
+      return sum + cost;
+    }, 0);
+
+    if (totalAccommodationCost > budget * 0.5) {
+      return { valid: false, error: `Accommodation costs (${totalAccommodationCost}) exceed 50% of budget (${budget})` };
+    }
+
+    return { valid: true };
+  }
+
+  const prompt = PLANNER(context);
+  const result = await callWithRetry(
+    prompt,
+    validateDays,
+    { maxRetries: 2, userId, tripId, featureType: 'planner' }
+  );
+
+  const orderedDays = result.days
+    .sort((a, b) => (a.dayNumber || 0) - (b.dayNumber || 0))
+    .map((day, idx) => ({ ...day, dayNumber: idx + 1 }));
+
+  return orderedDays;
 }
 
 const app = express();
@@ -239,6 +291,7 @@ start();
 module.exports = {
   app,
   enrichDestination,
+  plannerAgent,
   callWithRetry,
   buildAgentContext,
   AIError,
