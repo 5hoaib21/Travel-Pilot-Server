@@ -966,6 +966,26 @@ app.delete('/api/conversations/:tripId', async (req, res, next) => {
   }
 });
 
+app.get('/api/user/stats', async (req, res, next) => {
+  try {
+    const userId = req.headers['x-user-id'] || null;
+    if (!userId) return res.json({ totalTrips: 0, totalConversations: 0, totalCountries: 0 });
+
+    const db = await getDb();
+
+    const totalTrips = await db.collection('trips').countDocuments({ userId });
+
+    const totalConversations = await db.collection('ai_generations').countDocuments({ userId, featureType: 'copilot' });
+
+    const countries = await db.collection('trips').distinct('enrichedDestination.country', { userId });
+    const totalCountries = countries.filter(Boolean).length;
+
+    res.json({ totalTrips, totalConversations, totalCountries });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/api/user/profile', async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
