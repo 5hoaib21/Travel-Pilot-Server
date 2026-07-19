@@ -142,7 +142,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION, PLANNER } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER, BUDGETER } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -231,6 +231,54 @@ async function plannerAgent(context, userId = null, tripId = null) {
   return orderedDays;
 }
 
+async function budgeterAgent(context, userId = null, tripId = null) {
+  const budget = context.preferences.budget;
+
+  function validateBudget(parsed) {
+    if (!parsed.budgetBreakdown || !Array.isArray(parsed.budgetBreakdown)) {
+      return { valid: false, error: 'Missing budgetBreakdown array' };
+    }
+
+    const requiredCategories = ['Accommodation', 'Food', 'Activities', 'Transport', 'Miscellaneous'];
+    const categories = parsed.budgetBreakdown.map((b) => b.category);
+    for (const cat of requiredCategories) {
+      if (!categories.includes(cat)) {
+        return { valid: false, error: `Missing category: ${cat}` };
+      }
+    }
+
+    for (const item of parsed.budgetBreakdown) {
+      if (item.amount == null || item.percentage == null) {
+        return { valid: false, error: `Category ${item.category} missing amount or percentage` };
+      }
+      if (typeof item.amount !== 'number' || typeof item.percentage !== 'number') {
+        return { valid: false, error: `Category ${item.category} has non-numeric amount or percentage` };
+      }
+    }
+
+    const totalPercentage = Math.round(parsed.budgetBreakdown.reduce((sum, b) => sum + b.percentage, 0));
+    if (totalPercentage < 99 || totalPercentage > 101) {
+      return { valid: false, error: `Percentages sum to ${totalPercentage}%, expected ~100%` };
+    }
+
+    const totalAmount = parsed.budgetBreakdown.reduce((sum, b) => sum + b.amount, 0);
+    if (totalAmount > budget * 1.05) {
+      return { valid: false, error: `Total budget (${totalAmount}) exceeds trip budget (${budget}) by more than 5%` };
+    }
+
+    return { valid: true };
+  }
+
+  const prompt = BUDGETER(context);
+  const result = await callWithRetry(
+    prompt,
+    validateBudget,
+    { maxRetries: 2, userId, tripId, featureType: 'budgeter' }
+  );
+
+  return result.budgetBreakdown;
+}
+
 const app = express();
 const PORT = process.env.PORT || 8008;
 
@@ -292,6 +340,7 @@ module.exports = {
   app,
   enrichDestination,
   plannerAgent,
+  budgeterAgent,
   callWithRetry,
   buildAgentContext,
   AIError,
