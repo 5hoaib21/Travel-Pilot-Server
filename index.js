@@ -15,6 +15,55 @@ const AIErrorTypes = {
   AI_RATE_LIMIT: 'AI_RATE_LIMIT',
 };
 
+const SESSION_TTL = 30 * 60 * 1000;
+
+const sessionStore = {
+  _map: new Map(),
+  _cleanupTimer: null,
+
+  _startCleanup() {
+    if (!this._cleanupTimer) {
+      this._cleanupTimer = setInterval(() => this._cleanup(), 60 * 1000);
+    }
+  },
+
+  _cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this._map.entries()) {
+      if (now - entry.lastActivity > SESSION_TTL) {
+        this._map.delete(key);
+        logger.debug('Session expired', { key });
+      }
+    }
+  },
+
+  key(tripId, userId) {
+    return `${tripId}:${userId}`;
+  },
+
+  get(tripId, userId) {
+    this._startCleanup();
+    const k = this.key(tripId, userId);
+    const entry = this._map.get(k);
+    return entry || null;
+  },
+
+  set(tripId, userId, data) {
+    this._startCleanup();
+    const k = this.key(tripId, userId);
+    const existing = this._map.get(k) || { messages: [], learnedPreferences: { likes: [], dislikes: [], constraints: [] } };
+    this._map.set(k, {
+      messages: data.messages || existing.messages,
+      learnedPreferences: data.learnedPreferences || existing.learnedPreferences,
+      lastActivity: Date.now(),
+    });
+  },
+
+  delete(tripId, userId) {
+    this._map.delete(this.key(tripId, userId));
+  },
+};
+
 class AIError extends Error {
   constructor(type, message, details = null) {
     super(message);
@@ -399,6 +448,47 @@ async function reviewerAgent(context, userId = null, tripId = null) {
   return fixedContext;
 }
 
+async function buildCopilotContext(tripId, userId) {
+  const db = await getDb();
+  const trip = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(tripId) });
+  if (!trip) throw new Error('Trip not found');
+
+  const generations = await db.collection('ai_generations')
+    .find({ tripId, featureType: 'copilot' })
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .toArray();
+
+  const mergedMemory = { likes: [], dislikes: [], constraints: [] };
+  for (const gen of generations.reverse()) {
+    if (gen.memorySummary) {
+      mergedMemory.likes.push(...(gen.memorySummary.likes || []));
+      mergedMemory.dislikes.push(...(gen.memorySummary.dislikes || []));
+      mergedMemory.constraints.push(...(gen.memorySummary.constraints || []));
+    }
+  }
+
+  mergedMemory.likes = [...new Set(mergedMemory.likes)];
+  mergedMemory.dislikes = [...new Set(mergedMemory.dislikes)];
+  mergedMemory.constraints = [...new Set(mergedMemory.constraints)];
+
+  const session = sessionStore.get(tripId, userId);
+  const history = session ? session.messages.slice(-20) : [];
+
+  const preferences = {
+    destination: trip.enrichedDestination?.fullName || trip.destination,
+    budget: trip.budget,
+    currency: trip.currency,
+    duration: trip.duration,
+    travelStyle: trip.travelStyle,
+    interests: trip.interests,
+    companion: trip.companion,
+    additionalNotes: trip.additionalNotes,
+  };
+
+  return { trip, preferences, memory: mergedMemory, history };
+}
+
 async function generateTrip(preferences, userId = null) {
   const tripId = null;
 
@@ -765,6 +855,8 @@ module.exports = {
   budgeterAgent,
   curatorAgent,
   reviewerAgent,
+  buildCopilotContext,
+  sessionStore,
   callWithRetry,
   buildAgentContext,
   AIError,
