@@ -142,6 +142,43 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
+const { ENRICH_DESTINATION } = require('./prompts');
+
+async function enrichDestination(rawDestination, userId = null) {
+  if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
+    throw new AIError(AIErrorTypes.AI_PARSE_ERROR, 'Destination must be a non-empty string');
+  }
+
+  const prompt = ENRICH_DESTINATION(rawDestination.trim());
+  const result = await callWithRetry(
+    prompt,
+    (parsed) => {
+      if (!parsed || typeof parsed.found === 'undefined') {
+        return { valid: false, error: 'Response missing "found" field' };
+      }
+      if (parsed.found === true) {
+        if (!parsed.destination || !parsed.destination.fullName) {
+          return { valid: false, error: 'Response marked found but missing destination.fullName' };
+        }
+        if (!parsed.destination.continent) {
+          return { valid: false, error: 'Destination missing continent' };
+        }
+        if (!parsed.destination.currency) {
+          return { valid: false, error: 'Destination missing currency' };
+        }
+      }
+      return { valid: true };
+    },
+    { maxRetries: 2, userId, featureType: 'enrich_destination' }
+  );
+
+  if (!result.found) {
+    throw new AIError(AIErrorTypes.AI_PARSE_ERROR, result.message || 'Destination not recognized', { input: rawDestination });
+  }
+
+  return result.destination;
+}
+
 const app = express();
 const PORT = process.env.PORT || 8008;
 
@@ -199,4 +236,12 @@ async function start() {
 
 start();
 
-module.exports = app;
+module.exports = {
+  app,
+  enrichDestination,
+  callWithRetry,
+  buildAgentContext,
+  AIError,
+  AIErrorTypes,
+  logAICall,
+};

@@ -1,12 +1,28 @@
-const ENRICH_DESTINATION = (preferences) => `Given the destination "${preferences.destination}", provide structured data:
-- Full official name (including country)
-- Continent
-- Best months to visit (array)
-- Official language(s)
-- Currency code
-- Timezone
+const ENRICH_DESTINATION = (rawDestination) => `You are a travel destination expert. Resolve the following destination query to a real-world location.
 
-Return valid JSON only.`;
+User input: "${rawDestination}"
+
+Rules:
+1. If the input is a well-known nickname, abbreviation, or alternate name (e.g., "NYC", "Vegas", "The Big Apple", "Londres"), resolve it to the official destination.
+2. If the input is misspelled, infer the intended destination from context.
+3. If the input could match multiple places (e.g., "Paris", "Georgia"), return the most well-known / popular travel destination. Include a note about the alternative.
+4. If the input cannot be matched to any real destination, set "found" to false and provide a helpful message.
+
+Return valid JSON only in this exact schema:
+{
+  "found": boolean,
+  "destination": {
+    "fullName": "Full official name including country",
+    "country": "Country name",
+    "continent": "Continent name",
+    "bestMonths": ["Month1", "Month2", ...],
+    "language": "Official language(s)",
+    "currency": "Currency code (e.g., USD, JPY, EUR)",
+    "timezone": "Timezone(s)",
+    "notes": "Any alternate matches or clarification (null if none)"
+  },
+  "message": "User-friendly message about the match (null if found)"
+}`;
 
 const PLANNER = (context) => `You are a travel planning expert. Create a ${context.preferences.duration}-day itinerary for ${context.enrichedDestination.fullName}.
 
