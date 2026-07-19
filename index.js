@@ -623,9 +623,30 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
+function sanitizeInput(req, res, next) {
+  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
+    for (const [key, value] of Object.entries(req.body)) {
+      if (typeof value === 'string') {
+        req.body[key] = value.replace(/<[^>]*>/g, '');
+      }
+    }
+  }
+  next();
+}
+
+app.use('/api', sanitizeInput);
+
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait.', code: 'RATE_LIMITED' },
+});
+
+const readLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests. Please wait.', code: 'RATE_LIMITED' },
@@ -636,6 +657,10 @@ app.use('/api/trips/autosuggest', aiLimiter);
 app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
+app.use('/api/trips', readLimiter);
+app.use('/api/conversations', readLimiter);
+app.use('/api/user', readLimiter);
+app.use('/api/analytics', readLimiter);
 
 async function attachUser(req, res, next) {
   try {
