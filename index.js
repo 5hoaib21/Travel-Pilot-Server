@@ -142,7 +142,7 @@ async function callWithRetry(prompt, validateFn, options = {}) {
   throw lastError || new AIError(AIErrorTypes.AI_PARSE_ERROR, 'All retries exhausted');
 }
 
-const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR } = require('./prompts');
+const { ENRICH_DESTINATION, PLANNER, BUDGETER, CURATOR, REVIEWER } = require('./prompts');
 
 async function enrichDestination(rawDestination, userId = null) {
   if (!rawDestination || typeof rawDestination !== 'string' || rawDestination.trim().length < 1) {
@@ -318,6 +318,86 @@ async function curatorAgent(context, userId = null, tripId = null) {
   return result.tips;
 }
 
+async function reviewerAgent(context, userId = null, tripId = null) {
+  const fixes = [];
+
+  function validateReview(parsed) {
+    if (!parsed.review) {
+      return { valid: false, error: 'Missing review object' };
+    }
+    if (typeof parsed.review.passed !== 'boolean') {
+      return { valid: false, error: 'Review missing passed boolean' };
+    }
+    if (!Array.isArray(parsed.review.issues)) {
+      return { valid: false, error: 'Review missing issues array' };
+    }
+    if (!Array.isArray(parsed.review.warnings)) {
+      return { valid: false, error: 'Review missing warnings array' };
+    }
+    return { valid: true };
+  }
+
+  const prompt = REVIEWER(context);
+  let result;
+
+  try {
+    result = await callWithRetry(
+      prompt,
+      validateReview,
+      { maxRetries: 1, userId, tripId, featureType: 'reviewer' }
+    );
+  } catch (err) {
+    result = { review: { passed: false, issues: [err.message], warnings: [] } };
+  }
+
+  let fixedContext = { ...context };
+
+  if (!result.review.passed) {
+    logger.warn('Reviewer found issues, applying auto-fix', { issues: result.review.issues });
+
+    const bb = fixedContext.budgetBreakdown;
+    if (bb && Array.isArray(bb)) {
+      const totalPercent = bb.reduce((s, b) => s + (b.percentage || 0), 0);
+      if (totalPercent !== 100) {
+        const factor = 100 / totalPercent;
+        for (const item of bb) {
+          item.percentage = Math.round(item.percentage * factor);
+          item.amount = Math.round(item.amount * factor);
+        }
+        const remainder = 100 - bb.reduce((s, b) => s + b.percentage, 0);
+        if (remainder !== 0) {
+          const misc = bb.find((b) => b.category === 'Miscellaneous');
+          if (misc) misc.percentage += remainder;
+        }
+        fixes.push(`Clamped budget percentages from ${totalPercent}% to 100%`);
+      }
+    }
+
+    const budget = context.preferences?.budget;
+    if (budget && bb && Array.isArray(bb)) {
+      const totalAmount = bb.reduce((s, b) => s + (b.amount || 0), 0);
+      if (totalAmount > budget) {
+        const factor = budget / totalAmount;
+        for (const item of bb) {
+          item.amount = Math.round(item.amount * factor);
+        }
+        fixes.push(`Proportionally reduced budget amounts from ${totalAmount} to ${budget}`);
+      }
+    }
+
+    fixedContext.review = {
+      passed: fixes.length === 0,
+      issues: result.review.issues,
+      warnings: result.review.warnings,
+      fixes,
+    };
+  } else {
+    fixedContext.review = result.review;
+  }
+
+  return fixedContext;
+}
+
 const app = express();
 const PORT = process.env.PORT || 8008;
 
@@ -381,6 +461,7 @@ module.exports = {
   plannerAgent,
   budgeterAgent,
   curatorAgent,
+  reviewerAgent,
   callWithRetry,
   buildAgentContext,
   AIError,
