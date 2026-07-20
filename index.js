@@ -6,13 +6,20 @@ const rateLimit = require('express-rate-limit');
 const logger = require('./lib/logger');
 const { connectToDatabase, getDb } = require('./lib/db');
 const { ObjectId } = require('mongodb');
-const { generateContent, DEFAULT_MODEL } = require('./lib/gemini');
+const { generateContent, DEFAULT_MODEL } = require('./lib/ai');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const AIErrorTypes = {
   AI_PARSE_ERROR: 'AI_PARSE_ERROR',
   AI_TIMEOUT: 'AI_TIMEOUT',
   AI_SAFETY_BLOCK: 'AI_SAFETY_BLOCK',
   AI_RATE_LIMIT: 'AI_RATE_LIMIT',
+  AI_INVALID_KEY: 'AI_INVALID_KEY',
+  AI_BILLING_DISABLED: 'AI_BILLING_DISABLED',
+  AI_MODEL_UNAVAILABLE: 'AI_MODEL_UNAVAILABLE',
+  AI_NETWORK_ERROR: 'AI_NETWORK_ERROR',
 };
 
 const SESSION_TTL = 30 * 60 * 1000;
@@ -65,12 +72,13 @@ const sessionStore = {
 };
 
 class AIError extends Error {
-  constructor(type, message, details = null) {
+  constructor(type, message, details = null, upstream = null) {
     super(message);
     this.name = 'AIError';
     this.type = type;
     this.code = type;
     this.details = details;
+    this.upstream = upstream;
   }
 }
 
@@ -217,13 +225,10 @@ function validateBudgetOutput(parsed, budget) {
     if (!categories.includes(cat)) return { valid: false, error: `Missing category: ${cat}` };
   }
   for (const item of parsed.budgetBreakdown) {
-    if (item.amount == null || item.percentage == null) return { valid: false, error: `Category ${item.category} missing amount or percentage` };
-    if (typeof item.amount !== 'number' || typeof item.percentage !== 'number') return { valid: false, error: `Category ${item.category} has non-numeric amount or percentage` };
+    if (item.amount == null) return { valid: false, error: `Category ${item.category} missing amount` };
+    if (typeof item.amount !== 'number') return { valid: false, error: `Category ${item.category} has non-numeric amount` };
+    if (item.amount < 0) return { valid: false, error: `Category ${item.category} has negative amount` };
   }
-  const totalPercentage = Math.round(parsed.budgetBreakdown.reduce((sum, b) => sum + b.percentage, 0));
-  if (totalPercentage < 99 || totalPercentage > 101) return { valid: false, error: `Percentages sum to ${totalPercentage}%, expected ~100%` };
-  const totalAmount = parsed.budgetBreakdown.reduce((sum, b) => sum + b.amount, 0);
-  if (totalAmount > budget * 1.05) return { valid: false, error: `Total budget (${totalAmount}) exceeds trip budget (${budget}) by more than 5%` };
   return { valid: true };
 }
 
@@ -250,14 +255,49 @@ function validateReviewOutput(parsed) {
   return { valid: true };
 }
 
-function extractJSON(text) {
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new AIError(AIErrorTypes.AI_PARSE_ERROR, 'No JSON object found in AI response', { text });
-  try {
-    return JSON.parse(jsonMatch[0]);
-  } catch (err) {
-    throw new AIError(AIErrorTypes.AI_PARSE_ERROR, `Failed to parse AI response: ${err.message}`, { text: jsonMatch[0] });
+function extractJSON(text, context = {}) {
+  const cleaned = text.replace(/^```[a-z]*\n?/gm, '').replace(/```\n?/g, '').trim();
+  let idx = 0;
+  let best = null;
+  let lastError = null;
+
+  while ((idx = cleaned.indexOf('{', idx)) !== -1) {
+    let depth = 0;
+    let end = -1;
+    for (let i = idx; i < cleaned.length; i++) {
+      if (cleaned[i] === '{') depth++;
+      else if (cleaned[i] === '}') {
+        depth--;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+    if (end === -1) { idx++; continue; }
+
+    const candidate = cleaned.substring(idx, end + 1);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (!best || candidate.length > best.length) {
+        best = { parsed, length: candidate.length };
+      }
+    } catch (err) {
+      lastError = err;
+    }
+    idx = end + 1;
   }
+
+  if (best) return best.parsed;
+
+  const msg = lastError ? `Failed to parse AI response: ${lastError.message}` : 'No JSON object found in AI response';
+  const posMatch = lastError && lastError.message ? lastError.message.match(/position\s+(\d+)/) : null;
+  const pos = posMatch ? parseInt(posMatch[1]) : -1;
+  const ts = Date.now();
+  console.error(`\n========== AI JSON PARSE FAILURE [${ts}] ==========`);
+  console.error(`Error: ${msg}`);
+  if (pos >= 0) console.error(`Position: ${pos}`);
+  console.error(`Feature: ${context.featureType || 'unknown'}`);
+  console.error(`Attempt: ${context.attempt + 1 || '?'}`);
+  console.error(`=====================================================\n`);
+  throw new AIError(AIErrorTypes.AI_PARSE_ERROR, msg, { text });
 }
 
 async function callWithRetry(prompt, validateFn, options = {}) {
@@ -267,9 +307,11 @@ async function callWithRetry(prompt, validateFn, options = {}) {
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const start = Date.now();
+    let lastResult = null;
     try {
       const result = await generateContent(prompt, { modelName });
-      const parsed = extractJSON(result.text);
+      lastResult = result;
+      const parsed = extractJSON(result.text, { featureType, attempt });
       const responseTimeMs = Date.now() - start;
 
       if (validateFn) {
@@ -295,6 +337,35 @@ async function callWithRetry(prompt, validateFn, options = {}) {
       const responseTimeMs = Date.now() - start;
 
       if (err instanceof AIError && err.type === AIErrorTypes.AI_PARSE_ERROR) {
+        if (lastResult) {
+          const ts = Date.now();
+          const diagDir = path.join(os.tmpdir(), 'opencode-diag');
+          if (!fs.existsSync(diagDir)) fs.mkdirSync(diagDir, { recursive: true });
+          const finishReason = lastResult.candidates?.[0]?.finish_reason || 'unknown';
+          const diagFile = path.join(diagDir, `parse-error-${ts}.json`);
+          fs.writeFileSync(diagFile, JSON.stringify({
+            timestamp: ts,
+            featureType,
+            attempt: attempt + 1,
+            maxRetries: maxRetries + 1,
+            model: lastResult.model,
+            finishReason,
+            promptLength: prompt.length,
+            responseLength: lastResult.text.length,
+            error: err.message,
+            rawResponse: lastResult.text,
+          }, null, 2));
+          console.error(`[DIAG] Saved diagnostic to: ${diagFile}`);
+          console.error(`[DIAG] Feature: ${featureType}, attempt ${attempt + 1}/${maxRetries + 1}`);
+          console.error(`[DIAG] Model: ${lastResult.model}, finish_reason: ${finishReason}`);
+          console.error(`[DIAG] Response length: ${lastResult.text.length} chars`);
+          const posMatch = err.message.match(/position\s+(\d+)/);
+          if (posMatch) {
+            const pos = parseInt(posMatch[1]);
+            console.error(`[DIAG] Parse fails at JSON position: ${pos}`);
+          }
+        }
+
         lastError = err;
         logger.warn(`AI parse error on attempt ${attempt + 1}/${maxRetries + 1}`, { error: err.message, featureType });
 
@@ -318,18 +389,38 @@ async function callWithRetry(prompt, validateFn, options = {}) {
 
       if (err.isTimeout) {
         await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_TIMEOUT' });
-        throw new AIError(AIErrorTypes.AI_TIMEOUT, 'AI request timed out', { model: modelName });
+        throw new AIError(AIErrorTypes.AI_TIMEOUT, 'AI request timed out', { model: modelName }, err.upstream);
       }
       if (err.isSafety) {
         await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_SAFETY_BLOCK' });
-        throw new AIError(AIErrorTypes.AI_SAFETY_BLOCK, 'AI request blocked by safety filters');
+        throw new AIError(AIErrorTypes.AI_SAFETY_BLOCK, 'AI request blocked by safety filters', null, err.upstream);
       }
       if (err.isRateLimit) {
         await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_RATE_LIMIT' });
-        throw new AIError(AIErrorTypes.AI_RATE_LIMIT, 'AI rate limit exceeded');
+        const upstream = err.upstream || {};
+        let message = 'AI rate limit exceeded';
+        if (upstream.isDailyQuota) message = 'Daily AI quota has been exhausted. Please try again later or contact support.';
+        else if (upstream.isMinuteQuota) message = 'AI service is receiving too many requests. Please wait a moment and try again.';
+        throw new AIError(AIErrorTypes.AI_RATE_LIMIT, message, null, upstream);
+      }
+      if (err.upstream?.isInvalidKey) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_INVALID_KEY' });
+        throw new AIError(AIErrorTypes.AI_INVALID_KEY, 'The AI API key is invalid. Please check your backend configuration.', null, err.upstream);
+      }
+      if (err.upstream?.isBillingDisabled) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_BILLING_DISABLED' });
+        throw new AIError(AIErrorTypes.AI_BILLING_DISABLED, 'AI service billing or quota is not enabled. Please check your AI provider configuration.', null, err.upstream);
+      }
+      if (err.upstream?.isModelUnavailable) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_MODEL_UNAVAILABLE' });
+        throw new AIError(AIErrorTypes.AI_MODEL_UNAVAILABLE, 'The AI model is currently unavailable. Please try again later.', null, err.upstream);
+      }
+      if (err.upstream?.isNetworkFailure) {
+        await logAICall({ userId, tripId, featureType, prompt, response: null, model: modelName, responseTimeMs, success: false, errorMessage: 'AI_NETWORK_ERROR' });
+        throw new AIError(AIErrorTypes.AI_NETWORK_ERROR, 'Unable to reach the AI service. Please check your internet connection.', null, err.upstream);
       }
 
-      logger.error(`Unexpected AI error on attempt ${attempt + 1}`, { error: err.message, featureType });
+      logger.error(`Unexpected AI error on attempt ${attempt + 1}`, { error: err.message, featureType, upstream: err.upstream });
       lastError = err;
     }
   }
@@ -402,7 +493,23 @@ async function budgeterAgent(context, userId = null, tripId = null) {
     { maxRetries: 2, userId, tripId, featureType: 'budgeter' }
   );
 
-  return result.budgetBreakdown;
+  const breakdown = result.budgetBreakdown;
+  const nonMisc = breakdown.filter((b) => b.category !== 'Miscellaneous');
+  const misc = breakdown.find((b) => b.category === 'Miscellaneous');
+
+  const fixedSum = nonMisc.reduce((s, b) => s + b.amount, 0);
+  if (misc) misc.amount = Math.max(0, budget - fixedSum);
+
+  for (const item of breakdown) {
+    item.percentage = parseFloat(((item.amount / budget) * 100).toFixed(2));
+  }
+
+  if (misc) {
+    const pctSum = breakdown.reduce((s, b) => s + b.percentage, 0);
+    misc.percentage = parseFloat((misc.percentage + (100 - pctSum)).toFixed(2));
+  }
+
+  return breakdown;
 }
 
 async function curatorAgent(context, userId = null, tripId = null) {
@@ -440,7 +547,7 @@ async function reviewerAgent(context, userId = null, tripId = null) {
     const bb = fixedContext.budgetBreakdown;
     if (bb && Array.isArray(bb)) {
       const totalPercent = bb.reduce((s, b) => s + (b.percentage || 0), 0);
-      if (totalPercent !== 100) {
+      if (totalPercent !== 100 && totalPercent > 0) {
         const factor = 100 / totalPercent;
         for (const item of bb) {
           item.percentage = Math.round(item.percentage * factor);
@@ -565,7 +672,7 @@ async function copilotAgent(trip, preferences, memory, history, userMessage, use
     featureType: 'copilot',
     prompt,
     response: JSON.stringify(result),
-    model: 'gemini-2.0-flash',
+    model: DEFAULT_MODEL,
     responseTimeMs: 0,
     success: true,
     memorySummary,
@@ -609,6 +716,7 @@ async function generateTrip(preferences, userId = null) {
 
   const db = await getDb();
   const result = await db.collection('trips').insertOne(tripDoc);
+  console.log('[VERIFY insert] stored trip userId:', tripDoc.userId);
   tripDoc._id = result.insertedId;
 
   return tripDoc;
@@ -654,8 +762,8 @@ const readLimiter = rateLimit({
 
 app.use('/api/trips/generate', aiLimiter);
 app.use('/api/trips/autosuggest', aiLimiter);
-app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/regenerate-day', aiLimiter);
+app.use('/api/trips/:id/regenerate', aiLimiter);
 app.use('/api/trips/:id/copilot', aiLimiter);
 app.use('/api/trips', readLimiter);
 app.use('/api/conversations', readLimiter);
@@ -689,9 +797,43 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+const AI_ERROR_STATUS = {
+  AI_PARSE_ERROR: 400,
+  AI_TIMEOUT: 504,
+  AI_SAFETY_BLOCK: 400,
+  AI_RATE_LIMIT: 429,
+  AI_INVALID_KEY: 500,
+  AI_BILLING_DISABLED: 500,
+  AI_MODEL_UNAVAILABLE: 503,
+  AI_NETWORK_ERROR: 502,
+};
+
+function handleAIError(err, res) {
+  const status = AI_ERROR_STATUS[err.type] || 500;
+
+  if (err.upstream) {
+    logger.error('Upstream AI error', { message: err.upstream.upstreamMessage, type: err.type });
+  }
+
+  const body = {
+    error: err.message,
+    code: err.type,
+    provider: 'Groq',
+  };
+
+  if (err.upstream?.retryDelay) {
+    body.retryAfter = err.upstream.retryDelay;
+  }
+
+  return res.status(status).json(body);
+}
+
 app.post('/api/trips/generate', validate(generateTripRules), async (req, res, next) => {
   try {
     const userId = req.headers['x-user-id'] || null;
+    console.log('[VERIFY generate] incoming headers:', JSON.stringify(req.headers));
+    console.log('[VERIFY generate] req.user:', JSON.stringify(req.user));
+    console.log('[VERIFY generate] resolved userId:', userId);
     const prefs = req.body;
     if (prefs.destination) prefs.destination = stripHtmlTags(prefs.destination);
     if (prefs.additionalNotes) prefs.additionalNotes = stripHtmlTags(prefs.additionalNotes);
@@ -699,13 +841,7 @@ app.post('/api/trips/generate', validate(generateTripRules), async (req, res, ne
     const trip = await generateTrip(prefs, userId);
     res.status(201).json({ trip });
   } catch (err) {
-    if (err instanceof AIError) {
-      return res.status(400).json({
-        error: err.message,
-        code: err.type,
-        details: err.details,
-      });
-    }
+    if (err instanceof AIError) return handleAIError(err, res);
     next(err);
   }
 });
@@ -741,7 +877,7 @@ app.post('/api/trips/:id/regenerate', async (req, res, next) => {
     trip._id = id;
     res.json({ trip });
   } catch (err) {
-    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type, details: err.details });
+    if (err instanceof AIError) return handleAIError(err, res);
     next(err);
   }
 });
@@ -790,7 +926,7 @@ app.post('/api/trips/:id/regenerate-day', validate(regenerateDayRules), async (r
     const updated = await db.collection('trips').findOne({ _id: ObjectId.createFromHexString(id) });
     res.json({ trip: updated });
   } catch (err) {
-    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type, details: err.details });
+    if (err instanceof AIError) return handleAIError(err, res);
     next(err);
   }
 });
@@ -919,7 +1055,7 @@ app.post('/api/trips/:id/copilot', validate(copilotMessageRules), async (req, re
 
     res.json({ reply: result.reply, updatedTrip });
   } catch (err) {
-    if (err instanceof AIError) return res.status(400).json({ error: err.message, code: err.type });
+    if (err instanceof AIError) return handleAIError(err, res);
     next(err);
   }
 });
@@ -1155,7 +1291,7 @@ app.get('/api/trips/explore', async (req, res, next) => {
 
     const filter = { isPublic: true };
 
-    if (search) filter.destination = { $regex: search, $options: 'i' };
+    if (search) filter.destination = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     if (budgetMin || budgetMax) {
       filter.budget = {};
       if (budgetMin) filter.budget.$gte = Number(budgetMin);
@@ -1270,7 +1406,8 @@ app.get('/api/admin/users', attachUser, requireAdmin, async (req, res, next) => 
 
     const filter = {};
     if (search) {
-      const regex = { $regex: search, $options: 'i' };
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = { $regex: escaped, $options: 'i' };
       filter.$or = [{ name: regex }, { email: regex }];
     }
 

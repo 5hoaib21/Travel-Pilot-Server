@@ -35,32 +35,55 @@ BEST TIME: ${context.enrichedDestination.bestMonths.join(", ")}
 
 For each day, provide:
 - dayNumber (1-based)
-- morning: { title, description, location, category, cost, recommendedDuration, rating }
-- afternoon: { title, description, location, category, cost, recommendedDuration, rating }
-- evening: { title, description, location, category, cost, recommendedDuration, rating }
-- accommodation: { name, type, costPerNight, rating, notes }
-- notes (daily tip)
+- morning: { title, description (2-4 words), location (venue only), category, cost, recommendedDuration, rating }
+- afternoon: { title, description (2-4 words), location (venue only), category, cost, recommendedDuration, rating }
+- evening: { title, description (2-4 words), location (venue only), category, cost, recommendedDuration, rating }
+- accommodation: { name, type, costPerNight, rating, notes (5 words max) }
+- notes (8 words max daily tip)
 
 RULES:
+- Keep descriptions very short (2-4 words), locations are venue names only (no addresses)
 - Total estimated costs must not exceed ${context.preferences.currency} ${context.preferences.budget}
 - Accommodation costPerNight x ${context.preferences.duration} must fit within 30-50% of total budget
 - Distribute activities logically by geography (minimize backtracking)
 - Category must be one of: "attraction", "meal", "transport", "rest"
-- Return valid JSON only: { "days": [...] }`;
+- Return ONLY raw JSON. No markdown. No code blocks. No explanations. No JavaScript.
+  Use this exact structure with quoted keys and numeric values only:
+  {
+    "days": [
+      {
+        "dayNumber": 1,
+        "morning": { "title": "Temple Visit", "description": "Historic temple tour", "location": "Old City", "category": "attraction", "cost": 20, "recommendedDuration": 2, "rating": 4.5 },
+        "afternoon": { "title": "Local Lunch", "description": "Street food tasting", "location": "Market District", "category": "meal", "cost": 15, "recommendedDuration": 1.5, "rating": 4.0 },
+        "evening": { "title": "River Cruise", "description": "Scenic sunset cruise", "location": "Riverfront", "category": "attraction", "cost": 25, "recommendedDuration": 2, "rating": 4.2 },
+        "accommodation": { "name": "City Hotel", "type": "Hotel", "costPerNight": 100, "rating": 4.0, "notes": "Central location" },
+        "notes": "Book tickets in advance"
+      }
+    ]
+  }`;
 
 const BUDGETER = (context) => `Given this itinerary for ${context.enrichedDestination.fullName} with total budget ${context.preferences.currency} ${context.preferences.budget}, create a budget breakdown.
 
 Days: ${JSON.stringify(context.days)}
 
-Calculate and return:
+Calculate these four categories first:
 - Accommodation (based on costPerNight x duration)
 - Food (estimated from meal entries)
 - Activities (sum of activity costs)
 - Transport (estimated inter-city/local)
-- Miscellaneous (remainder + buffer)
+- Miscellaneous: just provide a reasonable buffer item (backend will compute the exact amount)
 
-Return valid JSON only: { "budgetBreakdown": [{ category, amount, percentage, items }] }
-Ensure percentages sum to 100.`;
+Return ONLY raw JSON. No markdown. No code blocks. No explanations. No JavaScript. No Python. No expressions. No percentages.
+Use this exact structure with quoted keys and numeric values only:
+{
+  "budgetBreakdown": [
+    { "category": "Accommodation", "amount": 800, "items": [{ "name": "Hotel", "costPerNight": 200, "duration": 4 }] },
+    { "category": "Food", "amount": 300, "items": [{ "name": "Meals", "cost": 75 }] },
+    { "category": "Activities", "amount": 200, "items": [{ "name": "Tours", "cost": 50 }] },
+    { "category": "Transport", "amount": 150, "items": [{ "name": "Local Transport", "cost": 30 }] },
+    { "category": "Miscellaneous", "amount": 0, "items": [{ "name": "Buffer", "cost": 0 }] }
+  ]
+}`;
 
 const CURATOR = (context) => `You are a travel expert providing destination tips for ${context.enrichedDestination.fullName}.
 
