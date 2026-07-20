@@ -80,7 +80,7 @@ async function seed() {
 
   const client = new MongoClient(MONGO_URI);
   try {
-    await client.connect();
+    // await client.connect();
     const db = client.db(DB_NAME);
     console.log('Connected to MongoDB\n');
 
